@@ -624,6 +624,9 @@ impl ElectrumSession {
             // So we store the last statuses for each script in this map.
             let mut last_statuses = ScriptStatuses::new();
 
+            // Whether `client` was just (re)built and so holds no script subscriptions.
+            let mut subscribe_all = true;
+
             let mut client = loop {
                 // In theory this loop is superfluous, because the client is created at the
                 // beginning of the next loop before being used, however, rust compiler thinks
@@ -660,7 +663,10 @@ impl ElectrumSession {
 
                 if !is_connected {
                     match url.build_client(proxy.as_deref(), None) {
-                        Ok(new_client) => client = new_client,
+                        Ok(new_client) => {
+                            client = new_client;
+                            subscribe_all = true;
+                        }
                         Err(e) => {
                             warn!("cannot build client {e:?}");
                             continue;
@@ -684,8 +690,12 @@ impl ElectrumSession {
                 };
 
                 let first_sync_bool = first_sync.load(Ordering::Relaxed);
-                match syncer.sync(&client, &mut last_statuses, first_sync_bool) {
+                if subscribe_all && !first_sync_bool {
+                    info!("client rebuilt, subscribing all scripts in batches");
+                }
+                match syncer.sync(&client, &mut last_statuses, subscribe_all) {
                     Ok(sync_result) => {
+                        subscribe_all = false;
                         state_updater.update_if_needed(true);
                         // Skip sending transaction notifications if it's the
                         // first call to sync. This allows us to _not_ notify
@@ -1292,7 +1302,7 @@ impl Syncer {
         &self,
         client: &Client,
         last_statuses: &mut ScriptStatuses,
-        first_sync: bool,
+        subscribe_all: bool,
     ) -> Result<SyncResult, Error> {
         trace!("start sync");
 
@@ -1313,7 +1323,7 @@ impl Syncer {
                 last_statuses,
                 &mut updated_txs,
                 &mut synced_spent_utxos,
-                first_sync,
+                subscribe_all,
             )?;
         }
 
@@ -1395,7 +1405,7 @@ impl Syncer {
         last_statuses: &mut ScriptStatuses,
         updated_txs: &mut HashMap<BETxid, BETransaction>,
         synced_spent_utxos: &mut HashSet<BEOutPoint>,
-        first_sync: bool,
+        subscribe_all: bool,
     ) -> Result<(), Error> {
         let map_script_txids = self.create_map_script_txids(account)?;
         let mut new_statuses = ScriptStatuses::new();
@@ -1425,8 +1435,8 @@ impl Syncer {
                     batch.iter().map(|(_, _, _, script)| script.clone().into_bitcoin()).collect();
 
                 // "script_subscribe" network calls
-                if first_sync {
-                    // During the first sync we haven't subscribed to any script yet, to minimize
+                if subscribe_all {
+                    // On a new client we haven't subscribed to any script yet, to minimize
                     // the network calls we do a batch request.
                     match client.batch_script_subscribe(b_scripts.iter().map(|s| s.as_script())) {
                         Ok(v) => {
